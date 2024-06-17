@@ -1,0 +1,182 @@
+#!/usr/bin/env groovy
+
+def projectPath = getProjectPath();
+def projectName = getProjectName();
+def branchName = getBranchName();
+
+class AAENV {
+    String name
+    String ikube_agent
+    String iesc_agent
+    String vault_name
+}
+
+// Define AA instances
+def AA_INSTANCE_LIST = [
+    "": null,
+    "prod1": new AAENV(name: 'prod1', kube_agent: 'kube-jenkins-slave-prod', vault_name: 'ansible_vault_prod'),
+    "staging": new AAENV(name: 'staging', kube_agent: 'kube-jenkins-slave-test', vault_name: 'ansible_vault_dev'),
+    "dev1": new AAENV(name: 'dev1', kube_agent: 'kube-jenkins-slave-test', vault_name: 'ansible_vault_dev'),
+    "dev2": new AAENV(name: 'dev2', kube_agent: 'kube-jenkins-slave-test', vault_name: 'ansible_vault_dev'),
+    "lab1": new AAENV(name: 'lab1', kube_agent: 'kube-jenkins-slave-test', vault_name: 'ansible_vault_dev'),
+    "lab2": new AAENV(name: 'lab2', kube_agent: 'kube-jenkins-slave-test', vault_name: 'ansible_vault_dev'),
+]
+
+pipeline {
+    agent none
+
+    options {
+        // valid options are
+        // 'vga', 'gnome-terminal' for output on dark background
+        // 'xterm', 'css' for output on light background
+        ansiColor('vga')
+        // timestamps()
+        // long timeout due to the full backup duration
+        timeout(time: 6, unit: 'HOURS')
+    }
+
+    parameters {
+        choice(
+            name: 'DEBUG_ANSIBLE',
+            choices: ['', '-v', '-vv', '-vvv', '-vvvv'],
+            description: 'Ansible verbose level (-vvv for more, -vvvv to enable connection debugging)'
+        )
+
+        choice(
+            name: 'AA_INSTANCE',
+            choices: AA_INSTANCE_LIST.keySet() as List,
+            description: 'Select the AA instance to be updated'
+        )
+
+        choice(
+            name: 'UPDATE_SCOPE',
+            choices: ['', 'mgmt-layer', 'all'], 
+            description: 'Scope of update, "all" may take longer'
+        )
+
+        booleanParam(
+            name: 'AA_UPDATE',
+            defaultValue: false,
+            description: 'Start  AA Update for selected AA_INSTANCE'
+        )
+
+    }
+
+    stages {
+        // stage('Approval'){
+        //     agent none
+        //     when{
+        //         expression { !(params.AAINSTANCE ==~ /.*local|^$|dev.*/) }
+        //         beforeAgent true
+        //     }
+        //     steps {
+        //         timeout(time: 10, unit: 'MINUTES'){
+        //             script{
+        //                 while("${env.approver}" == 'null' || "${env.approver}".equalsIgnoreCase(currentBuild.getBuildCauses()[0].userId))
+        //                     env.approver = input(message:"WARNING: Deploying to ${params.AAINSTANCE}. Please get approval from a second team member", submitterParameter:"approver")
+        //             }
+        //         }
+        //     }
+        // }
+
+        stage('AA Install or Update') {
+            when {
+                beforeAgent true
+                allOf {
+                    expression { params.AA_UPDATE == true }
+                    expression { params.AAINSTANCE != 'local' }
+                }
+            }
+
+            stages {  // SubStages 
+                stage('Helm Update') { // Sub Stage 1 
+                    agent { label "${AAINSTANCE_LIST[AAINSTANCE].ikube_agent}" }
+
+                    steps {
+                        script {
+                            echo "helm upgrade: ${AAINSTANCE_LIST[AAINSTANCE].name}"
+                            // ansiblePlaybook(
+                            //     playbook: 'playbooks/helm_install.yml',
+                            //     tags: 'tag1',
+                            //     inventory: "instances/${AAINSTANCE_LIST[AAINSTANCE].name}",
+                            //     vaultCredentialsId: "${AAINSTANCE_LIST[AAINSTANCE].vault_name}",
+                            //     extras: "$params.DEBUG_ANSIBLE",
+                            //     colorized: true
+                            // )
+                        }
+                    }
+                }  // 
+
+                stage('Operation Context Configuration') { // Stage Config 
+                    agent { label "${AAINSTANCE_LIST[AAINSTANCE].iesc_agent}" }
+
+                    steps {
+                        script {
+                            echo "Creating Operation Context: ${AAINSTANCE_LIST[AAINSTANCE].name}"
+                            // ansiblePlaybook(
+                            //     playbook: 'playbooks/oc_config.yml',
+                            //     tags: 'tag2',
+                            //     inventory: "instances/${AAINSTANCE_LIST[AAINSTANCE].name}",
+                            //     vaultCredentialsId: "${AAINSTANCE_LIST[AAINSTANCE].vault_name}",
+                            //     extras: "$params.DEBUG_ANSIBLE",
+                            //     colorized: true
+                            // )
+                        }
+                    }  // Steps
+                } // 
+
+            }  // SubStages
+        } // AA INstall or Update stage
+
+    }
+
+    post {
+        always {
+            echo 'Pipeline finished.'
+        }
+
+        failure {
+            echo "Build ${BUILD_TAG} failed. Sending an email..."
+            sendMail()
+        }
+    }
+}
+
+
+String cleanName(String name) {
+    return name.replaceAll("[^A-Za-z0-9-_.:]", ":");
+}
+
+String getProjectPath() {
+    def rootNameReverse = env.JOB_NAME.reverse();
+    def rootName = rootNameReverse.replaceFirst(env.JOB_BASE_NAME.reverse(), "").reverse();
+    return rootName.substring(0, rootName.length() - 1);
+}
+
+String getProjectName() {
+    def path = getProjectPath().tokenize('/') as String[];
+    return cleanName(path[-1]);
+}
+
+String getBranchName() {
+    return cleanName(env.BRANCH_NAME);
+}
+
+def sendMail() {
+    def bodyText = "<font face='calibri'>"
+        bodyText += "<p>Status: ${currentBuild.result}</p><p>Job: ${env.JOB_NAME}<br>Branch: ${branchName}"
+        bodyText += "<p>Check console output to view the results.<br>"
+        bodyText += "For pipeline job: ${BUILD_URL}<br>"
+
+    def subjectText = "${env.JOB_NAME}: Build #${BUILD_NUMBER}"
+
+    emailext(
+        mimeType: 'text/html',
+        compressLog:false,
+        attachLog:false,
+        body: "${bodyText}",
+        subject: "[AA] [CICD] ${subjectText}",
+        to: '$DEFAULT_RECIPIENTS',
+        recipientProviders: [ requestor() ]
+    )
+}
